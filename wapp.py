@@ -1,17 +1,16 @@
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from flask import Flask, request, jsonify, render_template_string, send_file
 from collections import deque
 from datetime import datetime
 import threading
 import json
 import os
 import socket
-from flask import Flask, send_file, send_from_directory
 
 app = Flask(__name__)
 
 # Конфигурация
-HISTORY_FILE = "../message_history.json"
-MAX_HISTORY_SIZE = 100
+HISTORY_FILE = "message_history2.json"
+MAX_HISTORY_SIZE = 10000
 ADMIN_IP = "127.0.0.1"  # IP администратора
 
 
@@ -30,12 +29,12 @@ def load_history():
 message_history = load_history()
 history_lock = threading.Lock()
 
-# HTML шаблон для мессенджера с формой ввода
+# HTML шаблон для мессенджера
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Govno Messenger</title>
+    <title>Local Messenger</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * {
@@ -139,6 +138,7 @@ HTML_TEMPLATE = """
             background-color: white;
             border-bottom-left-radius: 5px;
             align-self: flex-start;
+            margin-right: auto;
         }
 
         .message.own {
@@ -146,6 +146,7 @@ HTML_TEMPLATE = """
             color: white;
             border-bottom-right-radius: 5px;
             align-self: flex-end;
+            margin-left: auto;
         }
 
         .message.admin {
@@ -153,6 +154,7 @@ HTML_TEMPLATE = """
             color: white;
             border-bottom-right-radius: 5px;
             align-self: flex-end;
+            margin-left: auto;
         }
 
         .sender {
@@ -172,6 +174,12 @@ HTML_TEMPLATE = """
             line-height: 1.4;
             word-break: break-word;
             padding: 5px 0;
+        }
+
+        .ip-display {
+            font-size: 0.75rem;
+            opacity: 0.7;
+            margin-top: 3px;
         }
 
         .message-footer {
@@ -326,7 +334,7 @@ HTML_TEMPLATE = """
     <div class="container">
         <div class="header">
             <div class="header-content">
-                <h1>Govno Messenger</h1>
+                <h1>Local Messenger</h1>
                 <div class="subtitle">End-to-end encrypted communication</div>
             </div>
             <a href="/admin-message" class="admin-link">Последнее сообщение админа</a>
@@ -335,9 +343,9 @@ HTML_TEMPLATE = """
         <div class="messages-container" id="messages-container">
             {% if history %}
                 {% for msg in history %}
-                    <div class="message{% if msg.method == 'POST' %} own{% elif msg.admin %} admin{% else %} other{% endif %}">
+                    <div class="message{% if msg.is_own %} own{% elif msg.admin %} admin{% else %} other{% endif %}">
                         <div class="sender">
-                            {% if msg.method == 'POST' %}Вы{% elif msg.admin %}Админ{% else %}{{ msg.ip }}{% endif %}
+                            {% if msg.is_own %}Вы{% elif msg.admin %}Админ{% else %}{{ msg.ip }}{% endif %}
                         </div>
                         <div class="content">{{ msg.message }}</div>
                         <div class="message-footer">
@@ -378,6 +386,7 @@ HTML_TEMPLATE = """
             let isAtBottom = true;
             let lastMessageCount = {{ history|length if history else 0 }};
             let updateInterval;
+            let currentIP = "{{ current_ip }}";  // IP текущего пользователя
 
             // Прокрутить вниз при загрузке
             scrollToBottom();
@@ -419,39 +428,10 @@ HTML_TEMPLATE = """
 
                     if (data.status === 'success') {
                         input.value = '';
-
-                        // Добавляем новое сообщение в конец истории
-                        const now = new Date();
-                        const datetimeString = now.toLocaleString([], {
-                            day: '2-digit',
-                            month: '2-digit',
-                            year: 'numeric',
-                            hour: '2-digit',
-                            minute: '2-digit'
-                        }).replace(',', '');
-
-                        const noMessages = document.querySelector('.no-messages');
-                        if (noMessages) {
-                            noMessages.remove();
-                        }
-
-                        const messageElement = document.createElement('div');
-                        messageElement.className = 'message own';
-                        messageElement.innerHTML = `
-                            <div class="sender">Вы</div>
-                            <div class="content">${message}</div>
-                            <div class="message-footer">
-                                <div class="datetime">${datetimeString}</div>
-                            </div>
-                        `;
-
-                        messagesContainer.appendChild(messageElement);
-
-                        // Прокрутка к новому сообщению
-                        scrollToBottom();
-
-                        // Обновляем счетчик сообщений
-                        lastMessageCount++;
+                        // После отправки сразу запрашиваем обновленную историю
+                        await checkForNewMessages();
+                    } else {
+                        console.error("Ошибка отправки:", data.message);
                     }
                 } catch (error) {
                     console.error("Ошибка сети:", error);
@@ -480,18 +460,37 @@ HTML_TEMPLATE = """
                         // Добавляем новые сообщения
                         for (const msg of newMessages) {
                             const messageElement = document.createElement('div');
-                            const msgClass = msg.method === 'POST' ? 'own' : (msg.admin ? 'admin' : 'other');
+
+                            // Определяем класс сообщения
+                            let msgClass = 'other';
+                            if (msg.is_own) msgClass = 'own';
+                            else if (msg.admin) msgClass = 'admin';
+
                             messageElement.className = `message ${msgClass}`;
-                            messageElement.innerHTML = `
-                                <div class="sender">
-                                    ${msg.method === 'POST' ? 'Вы' : (msg.admin ? 'Админ' : msg.ip)}
-                                </div>
+
+                            // Определяем отправителя
+                            let sender = msg.ip;
+                            if (msg.is_own) sender = 'Вы';
+                            else if (msg.admin) sender = 'Админ';
+
+                            // Формируем содержимое сообщения
+                            let contentHTML = `
+                                <div class="sender">${sender}</div>
                                 <div class="content">${msg.message}</div>
+                            `;
+
+                            // Добавляем IP только для чужих сообщений
+                            if (!msg.is_own && !msg.admin) {
+                                contentHTML += `<div class="ip-display">IP: ${msg.ip}</div>`;
+                            }
+
+                            contentHTML += `
                                 <div class="message-footer">
                                     <div class="datetime">${msg.datetime}</div>
                                 </div>
                             `;
 
+                            messageElement.innerHTML = contentHTML;
                             messagesContainer.appendChild(messageElement);
                         }
 
@@ -509,7 +508,7 @@ HTML_TEMPLATE = """
             }
 
             // Запускаем периодическую проверку новых сообщений
-            updateInterval = setInterval(checkForNewMessages, 2000);
+            updateInterval = setInterval(checkForNewMessages, 1000);
 
             // Обработчики событий
             button.addEventListener('click', sendMessage);
@@ -547,50 +546,76 @@ def save_history():
 
 @app.route('/')
 def home():
+    # Получаем IP текущего пользователя
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    current_ip = client_ip.split(',')[0].strip() if ',' in client_ip else client_ip
+    current_ip = current_ip.split(':')[0]  # Убираем порт
+
+    # Помечаем сообщения как "свои" для текущего пользователя
     with history_lock:
-        # Передаем историю в естественном порядке (старые сверху, новые снизу)
-        history = list(message_history)
-    return render_template_string(HTML_TEMPLATE, history=history)
+        history = []
+        for msg in list(message_history):
+            # Создаем копию сообщения, чтобы не изменять оригинал
+            msg_copy = msg.copy()
+            # Сравниваем IP без порта
+            msg_ip = msg_copy['ip'].split(':')[0]  # Убираем порт
+            msg_copy['is_own'] = (msg_ip == current_ip)
+            history.append(msg_copy)
+
+    return render_template_string(HTML_TEMPLATE, history=history, current_ip=current_ip)
 
 
-@app.route('/message', methods=['POST', 'GET', 'PUT', 'DELETE'])
+@app.route('/message', methods=['POST'])
 def handle_message():
     # Получаем IP-адрес клиента
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    clean_ip = client_ip.split(',')[0].strip() if ',' in client_ip else client_ip
+    clean_ip = clean_ip.split(':')[0]  # Убираем порт
 
     # Извлекаем сообщение
     message = None
-    if request.method in ['POST', 'PUT']:
-        json_data = request.get_json(silent=True)
-        if json_data and 'message' in json_data:
-            message = json_data['message']
+    json_data = request.get_json(silent=True)
+    if json_data and 'message' in json_data:
+        message = json_data['message']
 
     # Логируем сообщение
-    if message:
-        is_admin = (client_ip == ADMIN_IP)
-        log_message(request.method, message, client_ip, is_admin)
-
-    # Формируем ответ
-    if request.method == 'POST':
-        return jsonify({
-            "status": "success",
-            "message": "Сообщение получено",
-            "your_message": message,
-            "ip": client_ip
-        })
+    if len(message_history) == 0:
+        if 'porn' in message:
+            message = 'Я тупой даун'
+        is_admin = (clean_ip == ADMIN_IP)
+        log_message('POST', message, clean_ip, is_admin)
     else:
-        return jsonify({
-            "status": "success",
-            "method": request.method,
-            "message": "Запрос обработан",
-            "ip": client_ip
-        })
+        if message != message_history[-1]['message']:
+            if 'porn' in message:
+                message = 'Я тупой даун'
+            is_admin = (clean_ip == ADMIN_IP)
+            log_message('POST', message, clean_ip, is_admin)
+
+    return jsonify({
+        "status": "success",
+        "message": "Сообщение получено",
+        "your_message": message,
+        "ip": clean_ip
+    })
 
 
 @app.route('/get-messages')
 def get_messages():
+    # Получаем IP текущего пользователя
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+    current_ip = client_ip.split(',')[0].strip() if ',' in client_ip else client_ip
+    current_ip = current_ip.split(':')[0]  # Убираем порт
+
     with history_lock:
-        history = list(message_history)
+        history = []
+        for msg in list(message_history):
+            # Создаем копию сообщения, чтобы не изменять оригинал
+            msg_copy = msg.copy()
+            # Сравниваем IP без порта
+            msg_ip = msg_copy['ip'].split(':')[0]  # Убираем порт
+            msg_copy['is_own'] = (msg_ip == current_ip)
+            history.append(msg_copy)
+
     return jsonify(history=history)
 
 
@@ -608,30 +633,14 @@ def admin_message():
             return "Нет сообщений администратора"
 
 
-@app.route('/download/<filename>')
-def download_file(filename):
-    """Скачивание файла"""
-    try:
-        return send_from_directory(
-            directory='files',
-            path=filename,
-            as_attachment=True,
-            download_name=filename
-        )
-    except FileNotFoundError:
-        return "File not found", 404
-
-
 def log_message(method, message, ip, is_admin=False):
     """Логирует сообщение в историю (добавляет в конец)"""
     # Получаем имя хоста по IP (если возможно)
     try:
-        # Убираем порт если он есть
-        ip = ip.split(':')[0]
         hostname = socket.gethostbyaddr(ip)[0]
         ip_display = f"{ip} ({hostname})"
     except:
-        ip_display = ip.split(':')[0]  # Убираем порт
+        ip_display = ip
 
     now = datetime.now()
     # Формат даты и времени: "дд.мм.гггг чч:мм"
@@ -651,6 +660,19 @@ def log_message(method, message, ip, is_admin=False):
 
     # Сохраняем историю в файл
     save_history()
+
+
+@app.route('/secret-file')
+def download_file():
+    # Укажите путь к файлу
+    file_path = 'hello.txt'
+    # Отправляем файл как вложение (as_attachment=True)
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name='hello.txt',  # Имя файла при скачивании
+        mimetype='text/plain'  # Тип содержимого
+    )
 
 
 if __name__ == '__main__':
